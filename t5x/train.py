@@ -317,9 +317,27 @@ def train(
       input_shapes=input_shapes,
       input_types=input_types,
       partitioner=partitioner)
+
+  # May be None, empty
+  valid_restore_cfg, restore_paths = utils.get_first_valid_restore_config_and_paths(
+      restore_cfgs)
+  checkpoint_manager = utils.LegacyCheckpointManager(
+      checkpoint_cfg.save,
+      valid_restore_cfg,
+      train_state_initializer.global_train_state_shape,
+      partitioner,
+      ds_iter=checkpointable_train_iter,
+      model_dir=model_dir)
   #  3. From scratch using `init_fn`.
-  train_state = train_state_initializer.from_checkpoint_or_scratch(
-      restore_cfgs, init_rng=init_rng, ds_iter=checkpointable_train_iter)
+  train_state = checkpoint_manager.restore(
+      restore_paths, valid_restore_cfg,
+      utils.get_fallback_state(
+          valid_restore_cfg,
+          lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
+          init_rng))
+  assert train_state is None or isinstance(train_state,
+                                           train_state_lib.TrainState)
+  train_state = train_state or train_state_initializer.from_scratch(init_rng)
   train_state_axes = train_state_initializer.train_state_axes
   init_or_restore_secs = time.time() - init_or_restore_tick
   logging.info('Initialize/restore complete (%.2f seconds).',
@@ -330,16 +348,6 @@ def train(
   utils.log_model_info(log_file,
                        train_state_initializer.global_train_state_shape,
                        partitioner)
-
-  if checkpoint_period:
-    checkpointer = checkpoint_cfg.save.checkpointer_cls(
-        train_state=train_state_initializer.global_train_state_shape,
-        partitioner=partitioner,
-        checkpoints_dir=model_dir,
-        dataset_iterator=(checkpointable_train_iter
-                          if checkpoint_cfg.save.save_dataset else None),
-        save_dtype=checkpoint_cfg.save.dtype,
-        keep=checkpoint_cfg.save.keep)
 
   # Restore step from last checkpoint or set to 0 if training from scratch.
   host_step = int(train_state.step)
@@ -524,8 +532,8 @@ def train(
       while host_step < epoch_end_step:
         if trainer.stop_training:
           logging.info('Saving a checkpoint before early stopping...')
-          checkpointer.save(trainer.train_state,
-                            checkpoint_cfg.save.state_transformation_fns)
+          checkpoint_manager.save(trainer.train_state,
+                                  checkpoint_cfg.save.state_transformation_fns)
           logging.info('Stopping training loop early since `stop_training` is '
                        'requested.')
           break
@@ -546,8 +554,8 @@ def train(
       logging.info('END Train loop.')
     except trainer_lib.PreemptionError as e:
       logging.info('Saving emergency checkpoint.')
-      checkpointer.save(trainer.train_state,
-                        checkpoint_cfg.save.state_transformation_fns)
+      checkpoint_manager.save(trainer.train_state,
+                              checkpoint_cfg.save.state_transformation_fns)
       logging.info('Saving emergency checkpoint done.')
       raise e
 
@@ -560,8 +568,8 @@ def train(
       train_summary.result()
       logging.info('Saving checkpoint.')
       checkpoint_tick = time.time()
-      checkpointer.save(trainer.train_state,
-                        checkpoint_cfg.save.state_transformation_fns)
+      checkpoint_manager.save(trainer.train_state,
+                              checkpoint_cfg.save.state_transformation_fns)
       checkpoint_tock = time.time()
       train_metrics.write_scalar('timing/checkpoint_seconds',
                                  checkpoint_tock - checkpoint_tick, host_step)

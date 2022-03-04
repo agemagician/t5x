@@ -38,6 +38,7 @@ from jax import prng
 from jax.experimental import multihost_utils
 import jax.numpy as jnp
 import numpy as np
+import orbax
 import seqio
 from t5x import checkpoints
 from t5x import partitioning
@@ -141,6 +142,193 @@ class CheckpointConfig:
   """Configuration for checkpointing of model and dataset."""
   save: Optional[SaveCheckpointConfig] = None
   restore: Optional[RestoreCheckpointConfig] = None
+
+
+class LegacyCheckpointer(orbax.Checkpointer):
+  """Implementation of Checkpointer interface for T5X.
+
+  Relies on underlying save_checkpointer and restore_checkpointer, which are
+  t5x.checkpoints.Checkpointer objects.
+  """
+
+  def __init__(self,
+               save_checkpointer: checkpoints.Checkpointer,
+               restore_checkpointer: checkpoints.Checkpointer,
+               *,
+               strict: Optional[bool] = False):
+    self._save_checkpointer = save_checkpointer
+    self._restore_checkpointer = restore_checkpointer
+    self._strict = strict
+
+  async def async_save(self, path: str, item: Any):
+    raise NotImplementedError
+
+  async def async_restore(self, path: str, item: Optional[Any] = None) -> Any:
+    raise NotImplementedError
+
+  def save(self,
+           path: str,
+           item: train_state_lib.TrainState,
+           state_transformation_fns: Sequence[
+               checkpoints.SaveStateTransformationFn] = (),
+           *,
+           concurrent_gb: int = 128):
+    """Performs save operation using save_checkpointer.
+
+    Args:
+      path: path to save item to.
+      item: a TrainState PyTree to save.
+      state_transformation_fns: Transformations to apply, in order, to the state
+        before writing.
+      concurrent_gb: the approximate number of gigabytes of partitionable
+        parameters to process in parallel. Useful to preserve RAM.
+    """
+    train_state = item
+    del path  # stored in save_checkpointer
+    # dataset_iterator is also saved, but is provided in checkpointer init
+    self._save_checkpointer.save(
+        train_state, state_transformation_fns, concurrent_gb=concurrent_gb)
+
+  def restore(self,
+              path: str,
+              item: Optional[train_state_lib.TrainState],
+              state_transformation_fns: Sequence[
+                  checkpoints.RestoreStateTransformationFn] = (),
+              fallback_state: Optional[Mapping[str, Any]] = None,
+              lazy_parameters: bool = False) -> train_state_lib.TrainState:
+    """Performs restore operation using restore_checkpointer.
+
+    Determines whether the indicated path is a Tensorflow checkpoint.
+
+    Args:
+      path: the string path to restore from.
+      item: a TrainState PyTree to restore. Unused.
+      state_transformation_fns: Transformations to apply, in order, to the state
+        before writing.
+      fallback_state: a state dict of an optimizer to fall back to for loading
+        params that do not exist in the checkpoint (after applying all
+        `state_transformation_fns`), but do exist in `Checkpointer.optimizer`.
+        The union of `fallback_state` and state loaded from the checkpoint must
+        match `Checkpointer.optimizer`.
+      lazy_parameters: whether to load the parameters as LazyArrays to preserve
+        memory.
+
+    Returns:
+      The restored train state.
+    """
+    del item  # not needed for restore in T5X
+    from_tensorflow = gfile.exists(path + '.index')
+    if from_tensorflow and state_transformation_fns:
+      raise ValueError('Cannot initialize from a TensorFlow checkpoint using '
+                       '`state_transformation_fns`.')
+    if from_tensorflow:
+      logging.info('Initializing parameters from TensorFlow checkpoint %s',
+                   path)
+      return self._restore_checkpointer.restore_from_tf_checkpoint(
+          path, strict=self._strict)
+    return self._restore_checkpointer.restore(
+        path=path,
+        state_transformation_fns=state_transformation_fns,
+        fallback_state=fallback_state,
+        lazy_parameters=lazy_parameters)
+
+
+class LegacyCheckpointManager(orbax.CheckpointManager):
+  """Implementation of CheckpointManager interface for T5X.
+
+  Uses underlying LegacyCheckpointer to handle save/restore for Dataset and
+  TrainState.
+  """
+
+  def __init__(self,
+               save_cfg: SaveCheckpointConfig,
+               restore_cfg: RestoreCheckpointConfig,
+               train_state_shape: train_state_lib.TrainState,
+               partitioner: partitioning.BasePartitioner,
+               ds_iter: Optional[tf.data.Iterator] = None,
+               model_dir: Optional[str] = None):
+    if save_cfg.save_dataset:
+      assert ds_iter is not None
+    save_checkpointer = save_cfg.checkpointer_cls(
+        train_state=train_state_shape,
+        partitioner=partitioner,
+        checkpoints_dir=model_dir,
+        dataset_iterator=ds_iter if save_cfg.save_dataset else None,
+        save_dtype=save_cfg.dtype,
+        keep=save_cfg.keep)
+
+    if restore_cfg:
+      restore_checkpointer = restore_cfg.checkpointer_cls(
+          train_state=train_state_shape,
+          partitioner=partitioner,
+          checkpoints_dir='',  # unused for restore
+          dataset_iterator=ds_iter if restore_cfg.restore_dataset else None,
+          restore_dtype=jnp.dtype(restore_cfg.dtype)
+          if restore_cfg.dtype else None)
+      strict = restore_cfg.strict
+    else:
+      restore_checkpointer = None
+      strict = False
+
+    self._checkpointer = LegacyCheckpointer(
+        save_checkpointer, restore_checkpointer, strict=strict)
+
+  def save(self,
+           train_state: train_state_lib.TrainState,
+           state_transformation_fns: Sequence[
+               checkpoints.SaveStateTransformationFn] = ()):
+    """Performs save operation.
+
+    Args:
+      train_state: a TrainState PyTree to save.
+      state_transformation_fns: Transformations to apply, in order, to the state
+        before writing.
+    """
+    self._checkpointer.save(
+        path='',  # not used
+        item=train_state,
+        state_transformation_fns=state_transformation_fns)
+
+  def restore(
+      self,
+      paths: Sequence[str],
+      restore_cfg: RestoreCheckpointConfig,
+      fallback_state: Optional[Mapping[str, Any]] = None
+  ) -> Union[train_state_lib.TrainState, Sequence[train_state_lib.TrainState]]:
+    """Performs restore operation using restore_checkpointer.
+
+    Determines whether the indicated path is a Tensorflow checkpoint.
+
+    Args:
+      paths: A sequence of paths to restore from.
+      restore_cfg: RestoreCheckpointConfig specifying restoration information.
+      fallback_state: a state dict of an optimizer to fall back to for loading
+        params that do not exist in the checkpoint (after applying all
+        `state_transformation_fns`), but do exist in `Checkpointer.optimizer`.
+        The union of `fallback_state` and state loaded from the checkpoint must
+        match `Checkpointer.optimizer`.
+
+    Returns:
+      The restored TrainState if only one TrainState can be restored from the
+      given paths, otherwise a sequence of TrainStates.
+    """
+    if restore_cfg is None or paths is None:
+      return None
+
+    restored = []
+    for path in paths:
+      logging.info('Initializing parameters from specific T5X checkpoint %s',
+                   path)
+      restored.append(
+          self._checkpointer.restore(
+              path=path,
+              item=None,  # not used
+              state_transformation_fns=restore_cfg.state_transformation_fns,
+              fallback_state=fallback_state))
+
+    if len(restored) == 1:
+      restored = restored[0]
+    return restored
 
 
 @dataclasses.dataclass
@@ -311,6 +499,63 @@ def create_learning_rate_scheduler(
   return step_fn
 
 
+def get_first_valid_restore_config_and_paths(
+    restore_cfgs: Sequence[RestoreCheckpointConfig]
+) -> Tuple[Optional[RestoreCheckpointConfig], Sequence[str]]:
+  """Returns first valid restore_cfg and the paths to restore."""
+  for restore_cfg in restore_cfgs:
+    paths = ([restore_cfg.path]
+             if isinstance(restore_cfg.path, str) else restore_cfg.path)
+    if restore_cfg.mode == 'specific':
+      return restore_cfg, paths
+    elif restore_cfg.mode in ('all', 'latest'):
+      for ckpt_dir in paths:
+        if not gfile.isdir(ckpt_dir):
+          raise ValueError(
+              'Checkpoint path(s) must be valid directories when using '
+              "restore mode 'all' or 'latest'.")
+        # Check if this is a TensorFlow checkpoint dir.
+        tf_ckpt_state = tf.train.get_checkpoint_state(ckpt_dir)
+
+        if tf_ckpt_state:
+          ckpt_paths = tf_ckpt_state.all_model_checkpoint_paths
+        else:
+          ckpt_paths = [
+              os.path.join(ckpt_dir, f'checkpoint_{step}')
+              for step in checkpoints.all_steps(ckpt_dir)
+          ]
+        if not ckpt_paths:
+          logging.info('No checkpoints found in specified directory: %s',
+                       ckpt_dir)
+          continue
+        if restore_cfg.mode == 'latest':
+          logging.info('Using latest T5X checkpoint.')
+          ckpt_paths = ckpt_paths[-1:]
+        return restore_cfg, ckpt_paths
+    else:
+      logging.error('Unsupported checkpoint restore mode: %s', restore_cfg.mode)
+  return None, []
+
+
+def get_fallback_state(restore_cfg: RestoreCheckpointConfig,
+                       init_fn: Callable[[jnp.ndarray], Mapping[str, Any]],
+                       init_rng: jnp.ndarray) -> Optional[Mapping[str, Any]]:
+  """Returns the fallback_state that can be used in restore()."""
+  if restore_cfg is None:
+    return
+  if restore_cfg.fallback_to_scratch:
+    if not restore_cfg.state_transformation_fns:
+      raise ValueError('`state_transformation_fns` must be provided with '
+                       '`fallback_to_scratch`')
+    if init_rng is None:
+      raise ValueError('An `init_rng` must be provided with '
+                       '`fallback_to_scratch`')
+    fallback_state = init_fn(init_rng)
+  else:
+    fallback_state = None
+  return fallback_state
+
+
 class TrainStateInitializer:
   """Helper for initializing partitioned TrainState from checkpoints or scratch.
 
@@ -439,16 +684,8 @@ class TrainStateInitializer:
             path, strict=cfg.strict)
 
       else:
-        if cfg.fallback_to_scratch:
-          if not cfg.state_transformation_fns:
-            raise ValueError('`state_transformation_fns` must be provided with '
-                             '`fallback_to_scratch`')
-          if init_rng is None:
-            raise ValueError('An `init_rng` must be provided with '
-                             '`fallback_to_scratch`')
-          fallback_state = self.from_scratch(init_rng).state_dict()
-        else:
-          fallback_state = None
+        fallback_state = get_fallback_state(
+            cfg, lambda rng: self.from_scratch(rng).state_dict(), init_rng)
 
         logging.info('Initializing parameters from specific T5X checkpoint %s',
                      path)
@@ -457,44 +694,9 @@ class TrainStateInitializer:
             state_transformation_fns=cfg.state_transformation_fns,
             fallback_state=fallback_state)
 
-    for restore_cfg in restore_cfgs:
-      paths = ([restore_cfg.path]
-               if isinstance(restore_cfg.path, str) else restore_cfg.path)
-      if restore_cfg.mode == 'specific':
-        logging.info('Restoring specific checkpoint(s): %s', paths)
-        for path in paths:
-          yield _restore_path(path, restore_cfg)
-        return
-      elif restore_cfg.mode in ('all', 'latest'):
-        for ckpt_dir in paths:
-          if not gfile.isdir(ckpt_dir):
-            raise ValueError(
-                'Checkpoint path(s) must be valid directories when using '
-                "restore mode 'all' or 'latest'.")
-          # Check if this is a TensorFlow checkpoint dir.
-          tf_ckpt_state = tf.train.get_checkpoint_state(ckpt_dir)
-
-          if tf_ckpt_state:
-            ckpt_paths = tf_ckpt_state.all_model_checkpoint_paths
-          else:
-            ckpt_paths = [
-                os.path.join(ckpt_dir, f'checkpoint_{step}')
-                for step in checkpoints.all_steps(ckpt_dir)
-            ]
-          if not ckpt_paths:
-            logging.info('No checkpoints found in specified directory: %s',
-                         ckpt_dir)
-            continue
-          if restore_cfg.mode == 'latest':
-            logging.info('Restoring latest T5X checkpoint.')
-            ckpt_paths = ckpt_paths[-1:]
-          logging.info('Restoring checkpoints for path(s): %s', ckpt_paths)
-          for ckpt_path in ckpt_paths:
-            yield _restore_path(ckpt_path, restore_cfg)
-          return
-      else:
-        raise ValueError(
-            f'Unsupported checkpoint restore mode: {restore_cfg.mode}')
+    restore_cfg, paths = get_first_valid_restore_config_and_paths(restore_cfgs)
+    for path in paths:
+      yield _restore_path(path, restore_cfg)
 
   def from_checkpoint(
       self,
