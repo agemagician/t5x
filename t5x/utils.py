@@ -619,6 +619,23 @@ class InferStepWithoutRngCallable(typing_extensions.Protocol):
 
 InferStepCallable = Union[InferStepWithRngCallable, InferStepWithoutRngCallable]
 
+# NOTE: We're not more prescriptive than PyTreeDef because that's what
+# InferStepCallable expects.
+_InferFnResult = Sequence[Tuple[int, PyTreeDef]]
+_InferFnWithAuxResult = Tuple[_InferFnResult, Mapping[str, Sequence[float]]]
+
+
+class InferFnCallable(typing_extensions.Protocol):
+
+  def __call__(
+      self,
+      ds: tf.data.Dataset,
+      train_state: train_state_lib.TrainState,
+      rng: Optional[jnp.ndarray] = None
+  ) -> Union[_InferFnResult, _InferFnWithAuxResult]:
+    """Runs inference on the dataset."""
+    ...
+
 
 def _remove_padding(all_inferences, all_indices):
   """Remove padded examples.
@@ -639,7 +656,7 @@ def _remove_padding(all_inferences, all_indices):
 
 def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
                  train_state_axes: train_state_lib.TrainState,
-                 partitioner: partitioning.BasePartitioner):
+                 partitioner: partitioning.BasePartitioner) -> InferFnCallable:
   """Get prediction function for the SeqIO evaluator.
 
   The returned prediction function should take in an enumerated dataset, make
@@ -781,6 +798,12 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     all_inferences = jax.tree_map(lambda x: x[all_indices], all_inferences)
     all_indices = all_indices[all_indices]
 
+    # We don't want to flatten/unflatten the aux values. We want to preserve
+    # with the type List[Mapping[str, float]].
+    aux_values = None
+    if isinstance(all_inferences, tuple):
+      all_inferences, aux_values = all_inferences
+
     # Translate to List[...] by flattening inferences making sure to
     # preserve structure of individual elements (inferences are not assumed to
     # be simple np.array). Finally, zip inferences with corresponding indices
@@ -791,8 +814,17 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     indices_and_outputs = list(zip(all_indices, all_inferences))
     indices_and_outputs = jax.tree_map(lambda x: jnp.array(x).tolist(),
                                        indices_and_outputs)
-    assert len(indices_and_outputs) == original_ds_length
-    return indices_and_outputs
+    if len(indices_and_outputs) != original_ds_length:
+      raise ValueError(
+          'Size of indices_and_outputs does not match length of original '
+          'dataset: %d versus %d' %
+          (len(indices_and_outputs), original_ds_length))
+
+    if aux_values is None:
+      return indices_and_outputs
+    else:
+      aux_values = jax.tree_map(lambda x: np.array(x).tolist(), aux_values)
+      return indices_and_outputs, aux_values
 
   return infer_fn
 
